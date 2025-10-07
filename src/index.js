@@ -16,7 +16,7 @@ export default {
     // Handle PDF generation requests (both / and /pdf paths)
     if (request.method === 'POST' && (pathname === '/' || pathname === '/pdf')) {
       try {
-        let html, options;
+        let requestBody;
 
         // Clone request to read body multiple times if needed
         const clonedRequest = request.clone();
@@ -32,28 +32,36 @@ export default {
 
         if (contentType.includes('application/json')) {
           try {
-            const body = JSON.parse(rawBody);
-            console.log('Received JSON body with keys:', Object.keys(body));
-            html = body.html;
-            options = body.options || {};
+            requestBody = JSON.parse(rawBody);
+            console.log('Received JSON body with keys:', Object.keys(requestBody));
           } catch (parseError) {
             console.error('JSON parse error:', parseError);
             throw new Error('Invalid JSON in request body');
           }
         } else {
-          html = rawBody;
-          options = {};
-        }
-
-        console.log('HTML length:', html?.length || 0);
-
-        if (!html) {
-          throw new Error('No HTML content provided. Expected { html: string, options?: object }');
+          // Plain HTML string - treat as single mode
+          requestBody = { html: rawBody };
         }
 
         // Verify browser binding exists
         if (!env.BROWSER) {
           throw new Error('Browser binding not configured. Check wrangler.jsonc browser.binding setting.');
+        }
+
+        // BATCH MODE
+        if (requestBody.batch && Array.isArray(requestBody.batch)) {
+          console.log(`Processing batch of ${requestBody.batch.length} items`);
+          return await this.processBatch(requestBody.batch, requestBody.concurrency || 3, env);
+        }
+
+        // SINGLE MODE (backward compatibility)
+        const html = requestBody.html;
+        const options = requestBody.options || {};
+
+        console.log('HTML length:', html?.length || 0);
+
+        if (!html) {
+          throw new Error('No HTML content provided. Expected { html: string, options?: object } or { batch: [...], concurrency?: number }');
         }
 
         const browser = await puppeteer.launch(env.BROWSER);
@@ -91,6 +99,110 @@ export default {
 
     console.log(`No route matched for ${request.method} ${pathname}`);
     return new Response(`Not Found: ${request.method} ${pathname}`, { status: 404 });
+  },
+
+  /**
+   * Process batch of HTML to PDF conversions with controlled concurrency
+   * @param {Array} batch - Array of { id, html, options } objects
+   * @param {number} concurrency - Max concurrent browser sessions (default: 3)
+   * @param {Object} env - Environment bindings
+   * @returns {Response} JSON response with results array
+   */
+  async processBatch(batch, concurrency, env) {
+    // Validate batch items
+    for (const item of batch) {
+      if (!item.html) {
+        throw new Error(`Batch item missing html property: ${JSON.stringify(item)}`);
+      }
+      if (!item.id) {
+        throw new Error(`Batch item missing id property: ${JSON.stringify(item)}`);
+      }
+    }
+
+    // Cap concurrency at 3 browsers max
+    const maxConcurrency = Math.min(concurrency, 3);
+    console.log(`Batch processing ${batch.length} items with ${maxConcurrency} concurrent browsers`);
+
+    // Distribute items across browser sessions in round-robin fashion
+    // For 7 items with concurrency=3: [[1,4,7], [2,5], [3,6]]
+    const chunks = Array.from({ length: maxConcurrency }, () => []);
+    batch.forEach((item, index) => {
+      chunks[index % maxConcurrency].push(item);
+    });
+
+    // Filter out empty chunks
+    const nonEmptyChunks = chunks.filter(chunk => chunk.length > 0);
+    console.log(`Distributed ${batch.length} items across ${nonEmptyChunks.length} browsers: ${nonEmptyChunks.map(c => c.length).join(', ')} items each`);
+
+    try {
+      // Process each chunk in parallel (each chunk = one browser session)
+      const allResults = await Promise.all(
+        nonEmptyChunks.map(async (chunk, chunkIndex) => {
+          console.log(`Browser ${chunkIndex + 1}/${nonEmptyChunks.length} processing ${chunk.length} items: ${chunk.map(c => c.id).join(', ')}`);
+
+          let browser;
+          try {
+            browser = await puppeteer.launch(env.BROWSER);
+
+            // Within this browser session, process items sequentially
+            const chunkResults = [];
+            for (const item of chunk) {
+              try {
+                const page = await browser.newPage();
+                await page.setContent(item.html, { waitUntil: 'networkidle0' });
+
+                const pdfOptions = {
+                  format: item.options?.format || 'A4',
+                  printBackground: item.options?.printBackground !== false,
+                  margin: item.options?.margin || { top: '1cm', right: '1cm', bottom: '1cm', left: '1cm' }
+                };
+
+                const pdf = await page.pdf(pdfOptions);
+
+                chunkResults.push({
+                  id: item.id,
+                  success: true,
+                  pdf: Buffer.from(pdf).toString('base64')
+                });
+
+                await page.close();
+                console.log(`Successfully processed item ${item.id}`);
+              } catch (itemError) {
+                console.error(`Error processing item ${item.id}:`, itemError);
+                chunkResults.push({
+                  id: item.id,
+                  success: false,
+                  error: itemError.message
+                });
+              }
+            }
+
+            return chunkResults;
+          } finally {
+            if (browser) {
+              await browser.close();
+              console.log(`Browser ${chunkIndex + 1} closed`);
+            }
+          }
+        })
+      );
+
+      // Flatten results from all browser sessions
+      const results = allResults.flat();
+      console.log(`Batch complete. Processed ${results.length} items`);
+
+      return new Response(JSON.stringify({
+        results,
+        total: results.length,
+        successful: results.filter(r => r.success).length,
+        failed: results.filter(r => !r.success).length
+      }), {
+        headers: { 'content-type': 'application/json' }
+      });
+    } catch (error) {
+      console.error('Batch processing error:', error);
+      throw error;
+    }
   },
 
   /**

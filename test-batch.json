@@ -1,0 +1,32 @@
+{
+  "batch": [
+    {
+      "id": "doc-1",
+      "html": "<html><body><h1>Document 1</h1><p>This is the first test document.</p></body></html>",
+      "options": {
+        "format": "A4",
+        "printBackground": true
+      }
+    },
+    {
+      "id": "doc-2",
+      "html": "<html><body><h1>Document 2</h1><p>This is the second test document.</p></body></html>",
+      "options": {
+        "format": "Letter"
+      }
+    },
+    {
+      "id": "doc-3",
+      "html": "<html><body><h1>Document 3</h1><p>This is the third test document with more content.</p><ul><li>Item 1</li><li>Item 2</li><li>Item 3</li></ul></body></html>"
+    },
+    {
+      "id": "doc-4",
+      "html": "<html><body><h1>Document 4</h1><table><tr><th>Name</th><th>Value</th></tr><tr><td>Test</td><td>123</td></tr></table></body></html>"
+    },
+    {
+      "id": "doc-5",
+      "html": "<html><body><h1>Document 5</h1><p>Final document in batch.</p></body></html>"
+    }
+  ],
+  "concurrency": 3
+}
