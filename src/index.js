@@ -13,16 +13,8 @@ export default {
 
     console.log(`Received ${request.method} request to ${pathname}`);
 
-    if (request.method === 'GET' && pathname === '/') {
-      return new Response(
-        'browser-render online ✅\n' +
-        'POST body = <html> → /pdf to get a PDF',
-        { headers: { 'content-type': 'text/plain' } }
-      );
-    }
-
-    // Handle direct POST requests for PDF generation
-    if (request.method === 'POST' && pathname === '/pdf') {
+    // Handle PDF generation requests (both / and /pdf paths)
+    if (request.method === 'POST' && (pathname === '/' || pathname === '/pdf')) {
       try {
         let html, options;
 
@@ -64,6 +56,15 @@ export default {
           headers: { 'content-type': 'application/json' }
         });
       }
+    }
+
+    // Health check for GET /
+    if (request.method === 'GET' && pathname === '/') {
+      return new Response(
+        'browser-render online ✅\n' +
+        'POST body = <html> → / or /pdf to get a PDF',
+        { headers: { 'content-type': 'text/plain' } }
+      );
     }
 
     console.log(`No route matched for ${request.method} ${pathname}`);
