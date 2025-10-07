@@ -18,17 +18,30 @@ export default {
       try {
         let html, options;
 
+        // Clone request to read body multiple times if needed
+        const clonedRequest = request.clone();
+
+        // Try to get raw body first for debugging
+        const rawBody = await clonedRequest.text();
+        console.log('Raw body length:', rawBody.length);
+        console.log('Raw body preview:', rawBody.substring(0, 200));
+
         // Check if body is JSON or plain HTML
         const contentType = request.headers.get('content-type') || '';
         console.log('Content-Type:', contentType);
 
         if (contentType.includes('application/json')) {
-          const body = await request.json();
-          console.log('Received JSON body with keys:', Object.keys(body));
-          html = body.html;
-          options = body.options || {};
+          try {
+            const body = JSON.parse(rawBody);
+            console.log('Received JSON body with keys:', Object.keys(body));
+            html = body.html;
+            options = body.options || {};
+          } catch (parseError) {
+            console.error('JSON parse error:', parseError);
+            throw new Error('Invalid JSON in request body');
+          }
         } else {
-          html = await request.text();
+          html = rawBody;
           options = {};
         }
 
