@@ -8,7 +8,12 @@ import puppeteer from '@cloudflare/puppeteer';
 export default {
   /* required so the script has an entry point */
   async fetch(request, env, ctx) {
-    if (request.method === 'GET' && new URL(request.url).pathname === '/') {
+    const url = new URL(request.url);
+    const pathname = url.pathname;
+
+    console.log(`Received ${request.method} request to ${pathname}`);
+
+    if (request.method === 'GET' && pathname === '/') {
       return new Response(
         'browser-render online ✅\n' +
         'POST body = <html> → /pdf to get a PDF',
@@ -17,7 +22,7 @@ export default {
     }
 
     // Handle direct POST requests for PDF generation
-    if (request.method === 'POST' && new URL(request.url).pathname === '/pdf') {
+    if (request.method === 'POST' && pathname === '/pdf') {
       try {
         let html, options;
 
@@ -61,7 +66,8 @@ export default {
       }
     }
 
-    return new Response('Not Found', { status: 404 });
+    console.log(`No route matched for ${request.method} ${pathname}`);
+    return new Response(`Not Found: ${request.method} ${pathname}`, { status: 404 });
   },
 
   /**
