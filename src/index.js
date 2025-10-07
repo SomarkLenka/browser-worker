@@ -18,34 +18,47 @@ export default {
 
     // Handle direct POST requests for PDF generation
     if (request.method === 'POST' && new URL(request.url).pathname === '/pdf') {
-      let html, options;
+      try {
+        let html, options;
 
-      // Check if body is JSON or plain HTML
-      const contentType = request.headers.get('content-type') || '';
-      if (contentType.includes('application/json')) {
-        const body = await request.json();
-        html = body.html;
-        options = body.options || {};
-      } else {
-        html = await request.text();
-        options = {};
+        // Check if body is JSON or plain HTML
+        const contentType = request.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          const body = await request.json();
+          html = body.html;
+          options = body.options || {};
+        } else {
+          html = await request.text();
+          options = {};
+        }
+
+        // Verify browser binding exists
+        if (!env.BROWSER) {
+          throw new Error('Browser binding not configured. Check wrangler.jsonc browser.binding setting.');
+        }
+
+        const browser = await puppeteer.launch(env.BROWSER);
+        const page = await browser.newPage();
+        await page.setContent(html, { waitUntil: 'networkidle0' });
+
+        const pdf = await page.pdf({
+          format: options.format || 'A4',
+          printBackground: options.printBackground !== false,
+          margin: options.margin || { top: '1cm', right: '1cm', bottom: '1cm', left: '1cm' }
+        });
+
+        await browser.close();
+
+        return new Response(pdf, {
+          headers: { 'content-type': 'application/pdf' }
+        });
+      } catch (error) {
+        console.error('PDF generation error:', error);
+        return new Response(JSON.stringify({ error: error.message }), {
+          status: 500,
+          headers: { 'content-type': 'application/json' }
+        });
       }
-
-      const browser = await puppeteer.launch(env.BROWSER);
-      const page = await browser.newPage();
-      await page.setContent(html, { waitUntil: 'networkidle0' });
-
-      const pdf = await page.pdf({
-        format: options.format || 'A4',
-        printBackground: options.printBackground !== false,
-        margin: options.margin || { top: '1cm', right: '1cm', bottom: '1cm', left: '1cm' }
-      });
-
-      await browser.close();
-
-      return new Response(pdf, {
-        headers: { 'content-type': 'application/pdf' }
-      });
     }
 
     return new Response('Not Found', { status: 404 });
