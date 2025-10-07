@@ -34,24 +34,7 @@ export default {
           try {
             const body = JSON.parse(rawBody);
             console.log('Received JSON body with keys:', Object.keys(body));
-
-            // Support both { html: "..." } and { url: "data:text/html..." } formats
-            if (body.html) {
-              html = body.html;
-            } else if (body.url) {
-              // Handle data URL format
-              if (body.url.startsWith('data:text/html;base64,')) {
-                const base64Data = body.url.slice('data:text/html;base64,'.length);
-                html = atob(base64Data);
-                console.log('Decoded HTML from base64 data URL');
-              } else if (body.url.startsWith('data:text/html,')) {
-                html = decodeURIComponent(body.url.slice('data:text/html,'.length));
-                console.log('Decoded HTML from data URL');
-              } else {
-                throw new Error('Unsupported URL format. Only data URLs are supported.');
-              }
-            }
-
+            html = body.html;
             options = body.options || {};
           } catch (parseError) {
             console.error('JSON parse error:', parseError);
@@ -65,7 +48,7 @@ export default {
         console.log('HTML length:', html?.length || 0);
 
         if (!html) {
-          throw new Error('No HTML content provided. Expected { html: string, options?: object } or { url: "data:text/html..." }');
+          throw new Error('No HTML content provided. Expected { html: string, options?: object }');
         }
 
         // Verify browser binding exists
