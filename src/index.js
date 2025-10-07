@@ -20,13 +20,22 @@ export default {
 
         // Check if body is JSON or plain HTML
         const contentType = request.headers.get('content-type') || '';
+        console.log('Content-Type:', contentType);
+
         if (contentType.includes('application/json')) {
           const body = await request.json();
+          console.log('Received JSON body with keys:', Object.keys(body));
           html = body.html;
           options = body.options || {};
         } else {
           html = await request.text();
           options = {};
+        }
+
+        console.log('HTML length:', html?.length || 0);
+
+        if (!html) {
+          throw new Error('No HTML content provided. Expected { html: string, options?: object }');
         }
 
         // Verify browser binding exists
