@@ -19,7 +19,7 @@ export default {
     // Handle direct POST requests for testing
     if (request.method === 'POST' && new URL(request.url).pathname === '/pdf') {
       const html = await request.text();
-      const browser = await puppeteer.launch(env.BROWSER);
+      const browser = await puppeteer.connect(env.BROWSER);
       const page = await browser.newPage();
       await page.setContent(html);
       const pdf = await page.pdf({ format: 'A4', printBackground: true });
@@ -45,7 +45,7 @@ export default {
     let browser;
     try {
       // Launch browser using Cloudflare Puppeteer
-      browser = await puppeteer.launch(env.BROWSER);
+      browser = await puppeteer.connect(env.BROWSER);
       const page = await browser.newPage();
 
       // Set the HTML content
