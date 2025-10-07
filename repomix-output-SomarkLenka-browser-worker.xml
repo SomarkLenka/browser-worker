@@ -1,0 +1,906 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+The content has been processed where security check has been disabled.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Security check has been disabled - content may contain sensitive information
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+src/
+  index.js
+test/
+  index.spec.js
+.editorconfig
+.gitignore
+.prettierrc
+BATCH-PROCESSING.md
+package.json
+test-batch.json
+vitest.config.js
+wrangler.jsonc
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="src/index.js">
+import puppeteer from '@cloudflare/puppeteer';
+
+/**
+ * Sleep utility for delays
+ */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Launch browser with retry logic and exponential backoff
+ */
+async function launchBrowserWithRetry(env, maxRetries = 3, initialDelay = 1000) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`Launching browser (attempt ${attempt}/${maxRetries})`);
+      return await puppeteer.launch(env.BROWSER);
+    } catch (error) {
+      lastError = error;
+      console.error(`Browser launch attempt ${attempt} failed:`, error.message);
+
+      // Check if it's a rate limit error
+      if (error.message?.includes('429') || error.message?.includes('Rate limit')) {
+        if (attempt < maxRetries) {
+          const delay = initialDelay * Math.pow(2, attempt - 1);
+          console.log(`Rate limit hit, waiting ${delay}ms before retry...`);
+          await sleep(delay);
+          continue;
+        }
+      }
+
+      // If not rate limit or last attempt, throw
+      if (attempt === maxRetries) {
+        throw new Error(`Failed to launch browser after ${maxRetries} attempts: ${error.message}`);
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+/**
+ *  Browser-Rendering Worker
+ *  – one public GET / for health
+ *  – one RPC method htmlToPdf() that other Workers call via service binding
+ */
+export default {
+  /* required so the script has an entry point */
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const pathname = url.pathname;
+
+    console.log(`Received ${request.method} request to ${pathname}`);
+
+    // Handle PDF generation requests (both / and /pdf paths)
+    if (request.method === 'POST' && (pathname === '/' || pathname === '/pdf')) {
+      try {
+        let requestBody;
+
+        // Clone request to read body multiple times if needed
+        const clonedRequest = request.clone();
+
+        // Try to get raw body first for debugging
+        const rawBody = await clonedRequest.text();
+        console.log('Raw body length:', rawBody.length);
+        console.log('Raw body preview:', rawBody.substring(0, 200));
+
+        // Check if body is JSON or plain HTML
+        const contentType = request.headers.get('content-type') || '';
+        console.log('Content-Type:', contentType);
+
+        if (contentType.includes('application/json')) {
+          try {
+            requestBody = JSON.parse(rawBody);
+            console.log('Received JSON body with keys:', Object.keys(requestBody));
+          } catch (parseError) {
+            console.error('JSON parse error:', parseError);
+            throw new Error('Invalid JSON in request body');
+          }
+        } else {
+          // Plain HTML string - treat as single mode
+          requestBody = { html: rawBody };
+        }
+
+        // Verify browser binding exists
+        if (!env.BROWSER) {
+          throw new Error('Browser binding not configured. Check wrangler.jsonc browser.binding setting.');
+        }
+
+        // BATCH MODE
+        if (requestBody.batch && Array.isArray(requestBody.batch)) {
+          console.log(`Processing batch of ${requestBody.batch.length} items`);
+          return await this.processBatch(requestBody.batch, requestBody.concurrency || 2, env);
+        }
+
+        // SINGLE MODE (backward compatibility)
+        const html = requestBody.html;
+        const options = requestBody.options || {};
+
+        console.log('HTML length:', html?.length || 0);
+
+        if (!html) {
+          throw new Error('No HTML content provided. Expected { html: string, options?: object } or { batch: [...], concurrency?: number }');
+        }
+
+        const browser = await launchBrowserWithRetry(env);
+        const page = await browser.newPage();
+        await page.setContent(html, { waitUntil: 'networkidle0' });
+
+        const pdf = await page.pdf({
+          format: options.format || 'A4',
+          printBackground: options.printBackground !== false,
+          margin: options.margin || { top: '1cm', right: '1cm', bottom: '1cm', left: '1cm' }
+        });
+
+        await browser.close();
+
+        return new Response(pdf, {
+          headers: { 'content-type': 'application/pdf' }
+        });
+      } catch (error) {
+        console.error('PDF generation error:', error);
+        return new Response(JSON.stringify({ error: error.message }), {
+          status: 500,
+          headers: { 'content-type': 'application/json' }
+        });
+      }
+    }
+
+    // Health check for GET /
+    if (request.method === 'GET' && pathname === '/') {
+      return new Response(
+        'browser-render online ✅\n' +
+        'POST body = <html> → / or /pdf to get a PDF',
+        { headers: { 'content-type': 'text/plain' } }
+      );
+    }
+
+    console.log(`No route matched for ${request.method} ${pathname}`);
+    return new Response(`Not Found: ${request.method} ${pathname}`, { status: 404 });
+  },
+
+  /**
+   * Process batch of HTML to PDF conversions with controlled concurrency
+   * @param {Array} batch - Array of { id, html, options } objects
+   * @param {number} concurrency - Max concurrent browser sessions (default: 2)
+   * @param {Object} env - Environment bindings
+   * @returns {Response} JSON response with results array
+   *
+   * Note: Cloudflare limits: 3 browsers per account, 3 new browsers per minute
+   */
+  async processBatch(batch, concurrency, env) {
+    // Validate batch items
+    for (const item of batch) {
+      if (!item.html) {
+        throw new Error(`Batch item missing html property: ${JSON.stringify(item)}`);
+      }
+      if (!item.id) {
+        throw new Error(`Batch item missing id property: ${JSON.stringify(item)}`);
+      }
+    }
+
+    // Cap concurrency at 2 browsers to stay under rate limits (3/minute)
+    // This allows for retries without hitting the limit
+    const maxConcurrency = Math.min(concurrency, 2);
+    console.log(`Batch processing ${batch.length} items with ${maxConcurrency} concurrent browsers`);
+
+    // Distribute items across browser sessions in round-robin fashion
+    // For 7 items with concurrency=2: [[1,3,5,7], [2,4,6]]
+    const chunks = Array.from({ length: maxConcurrency }, () => []);
+    batch.forEach((item, index) => {
+      chunks[index % maxConcurrency].push(item);
+    });
+
+    // Filter out empty chunks
+    const nonEmptyChunks = chunks.filter(chunk => chunk.length > 0);
+    console.log(`Distributed ${batch.length} items across ${nonEmptyChunks.length} browsers: ${nonEmptyChunks.map(c => c.length).join(', ')} items each`);
+
+    try {
+      const allResults = [];
+
+      // Process browsers sequentially with delay to respect rate limits (3/minute)
+      for (let chunkIndex = 0; chunkIndex < nonEmptyChunks.length; chunkIndex++) {
+        const chunk = nonEmptyChunks[chunkIndex];
+        console.log(`Browser ${chunkIndex + 1}/${nonEmptyChunks.length} processing ${chunk.length} items: ${chunk.map(c => c.id).join(', ')}`);
+
+        // Add delay between browser launches (20+ seconds to stay under 3/minute)
+        if (chunkIndex > 0) {
+          const delayMs = 22000; // 22 seconds between launches
+          console.log(`Waiting ${delayMs}ms before launching next browser (rate limit: 3/minute)...`);
+          await sleep(delayMs);
+        }
+
+        let browser;
+        try {
+          browser = await launchBrowserWithRetry(env);
+
+            // Within this browser session, process items sequentially
+            const chunkResults = [];
+            for (const item of chunk) {
+              try {
+                const page = await browser.newPage();
+                await page.setContent(item.html, { waitUntil: 'networkidle0' });
+
+                const pdfOptions = {
+                  format: item.options?.format || 'A4',
+                  printBackground: item.options?.printBackground !== false,
+                  margin: item.options?.margin || { top: '1cm', right: '1cm', bottom: '1cm', left: '1cm' }
+                };
+
+                const pdf = await page.pdf(pdfOptions);
+
+                chunkResults.push({
+                  id: item.id,
+                  success: true,
+                  pdf: Buffer.from(pdf).toString('base64')
+                });
+
+                await page.close();
+                console.log(`Successfully processed item ${item.id}`);
+              } catch (itemError) {
+                console.error(`Error processing item ${item.id}:`, itemError);
+                chunkResults.push({
+                  id: item.id,
+                  success: false,
+                  error: itemError.message
+                });
+              }
+            }
+
+          allResults.push(...chunkResults);
+        } finally {
+          if (browser) {
+            await browser.close();
+            console.log(`Browser ${chunkIndex + 1} closed`);
+          }
+        }
+      }
+
+      console.log(`Batch complete. Processed ${allResults.length} items`);
+
+      return new Response(JSON.stringify({
+        results: allResults,
+        total: allResults.length,
+        successful: allResults.filter(r => r.success).length,
+        failed: allResults.filter(r => !r.success).length
+      }), {
+        headers: { 'content-type': 'application/json' }
+      });
+    } catch (error) {
+      console.error('Batch processing error:', error);
+      throw error;
+    }
+  },
+
+  /**
+   * Called from another Worker via
+   *    const pdfBuf = await env.BROWSER.htmlToPdf({ body: html, cf: { format: "A4" } });
+   */
+  async htmlToPdf(request, env, ctx) {
+    // request is an object with body (HTML string) and cf (options)
+    const html = request.body || request;  // support both formats
+    const options = request.cf || { format: 'A4' };
+
+    let browser;
+    try {
+      // Launch browser with retry logic
+      browser = await launchBrowserWithRetry(env);
+      const page = await browser.newPage();
+
+      // Set the HTML content
+      await page.setContent(html, { waitUntil: 'networkidle0' });
+
+      // Generate PDF with options
+      const pdf = await page.pdf({
+        format: options.format || 'A4',
+        printBackground: true,
+        margin: { top: '1cm', right: '1cm', bottom: '1cm', left: '1cm' }
+      });
+
+      return pdf;
+    } catch (error) {
+      console.error('PDF generation error:', error);
+      throw error;
+    } finally {
+      if (browser) {
+        try {
+          await browser.close();
+        } catch (closeError) {
+          console.error('Error closing browser:', closeError);
+        }
+      }
+    }
+  }
+}
+</file>
+
+<file path="test/index.spec.js">
+import { env, createExecutionContext, waitOnExecutionContext, SELF } from 'cloudflare:test';
+import { describe, it, expect } from 'vitest';
+import worker from '../src';
+
+describe('Hello World worker', () => {
+	it('responds with Hello World! (unit style)', async () => {
+		const request = new Request('http://example.com');
+		// Create an empty context to pass to `worker.fetch()`.
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		// Wait for all `Promise`s passed to `ctx.waitUntil()` to settle before running test assertions
+		await waitOnExecutionContext(ctx);
+		expect(await response.text()).toMatchInlineSnapshot(`"Hello World!"`);
+	});
+
+	it('responds with Hello World! (integration style)', async () => {
+		const response = await SELF.fetch('http://example.com');
+		expect(await response.text()).toMatchInlineSnapshot(`"Hello World!"`);
+	});
+});
+</file>
+
+<file path=".editorconfig">
+# http://editorconfig.org
+root = true
+
+[*]
+indent_style = tab
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+[*.yml]
+indent_style = space
+</file>
+
+<file path=".gitignore">
+# Logs
+
+logs
+_.log
+npm-debug.log_
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# Diagnostic reports (https://nodejs.org/api/report.html)
+
+report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+
+# Runtime data
+
+pids
+_.pid
+_.seed
+\*.pid.lock
+
+# Directory for instrumented libs generated by jscoverage/JSCover
+
+lib-cov
+
+# Coverage directory used by tools like istanbul
+
+coverage
+\*.lcov
+
+# nyc test coverage
+
+.nyc_output
+
+# Grunt intermediate storage (https://gruntjs.com/creating-plugins#storing-task-files)
+
+.grunt
+
+# Bower dependency directory (https://bower.io/)
+
+bower_components
+
+# node-waf configuration
+
+.lock-wscript
+
+# Compiled binary addons (https://nodejs.org/api/addons.html)
+
+build/Release
+
+# Dependency directories
+
+node_modules/
+jspm_packages/
+
+# Snowpack dependency directory (https://snowpack.dev/)
+
+web_modules/
+
+# TypeScript cache
+
+\*.tsbuildinfo
+
+# Optional npm cache directory
+
+.npm
+
+# Optional eslint cache
+
+.eslintcache
+
+# Optional stylelint cache
+
+.stylelintcache
+
+# Microbundle cache
+
+.rpt2_cache/
+.rts2_cache_cjs/
+.rts2_cache_es/
+.rts2_cache_umd/
+
+# Optional REPL history
+
+.node_repl_history
+
+# Output of 'npm pack'
+
+\*.tgz
+
+# Yarn Integrity file
+
+.yarn-integrity
+
+# parcel-bundler cache (https://parceljs.org/)
+
+.cache
+.parcel-cache
+
+# Next.js build output
+
+.next
+out
+
+# Nuxt.js build / generate output
+
+.nuxt
+dist
+
+# Gatsby files
+
+.cache/
+
+# Comment in the public line in if your project uses Gatsby and not Next.js
+
+# https://nextjs.org/blog/next-9-1#public-directory-support
+
+# public
+
+# vuepress build output
+
+.vuepress/dist
+
+# vuepress v2.x temp and cache directory
+
+.temp
+.cache
+
+# Docusaurus cache and generated files
+
+.docusaurus
+
+# Serverless directories
+
+.serverless/
+
+# FuseBox cache
+
+.fusebox/
+
+# DynamoDB Local files
+
+.dynamodb/
+
+# TernJS port file
+
+.tern-port
+
+# Stores VSCode versions used for testing VSCode extensions
+
+.vscode-test
+
+# yarn v2
+
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.\*
+
+# wrangler project
+
+.dev.vars*
+!.dev.vars.example
+.env*
+!.env.example
+.wrangler/
+</file>
+
+<file path=".prettierrc">
+{
+	"printWidth": 140,
+	"singleQuote": true,
+	"semi": true,
+	"useTabs": true
+}
+</file>
+
+<file path="BATCH-PROCESSING.md">
+# Batch Processing Documentation
+
+## Overview
+
+The browser-worker now supports hybrid batch processing with controlled concurrency. This allows you to process multiple HTML to PDF conversions efficiently by spawning up to 3 concurrent browser sessions.
+
+## Architecture
+
+### Strategy
+- **Single Activity (1 item)**: Direct single call
+- **Small Batch (2-4 items)**: Single batch call, sequential processing in one browser session
+- **Large Batch (5+ items)**: Multiple browser sessions with staggered launches
+
+### Implementation Details
+- **Rate Limits (Cloudflare Workers Browser Binding)**:
+  - Maximum concurrent browsers: **3 per account**
+  - Maximum new browsers: **3 per minute**
+  - Browser timeout: **60 seconds** (can extend to 10 minutes with keep_alive)
+
+- **Our Approach**:
+  - Default concurrency: **2 browsers** (leaves room for retries)
+  - Staggered browser launches: **22 second delay** between launches
+  - Retry logic with exponential backoff for rate limit errors
+  - Multiple PDFs generated per browser session using tabs (efficient reuse)
+
+- Each item in a batch must have a unique `id` for tracking
+- Robust error handling per item (one failure doesn't stop the batch)
+- Browser sessions are reused for multiple PDFs to optimize performance
+
+## Request Formats
+
+### Single Mode (Backward Compatible)
+```json
+{
+  "html": "<html><body>Your content</body></html>",
+  "options": {
+    "format": "A4",
+    "printBackground": true,
+    "margin": {
+      "top": "1cm",
+      "right": "1cm",
+      "bottom": "1cm",
+      "left": "1cm"
+    }
+  }
+}
+```
+
+**Response**: PDF binary (application/pdf)
+
+### Batch Mode
+```json
+{
+  "batch": [
+    {
+      "id": "unique-id-1",
+      "html": "<html><body>Document 1</body></html>",
+      "options": {
+        "format": "A4",
+        "printBackground": true
+      }
+    },
+    {
+      "id": "unique-id-2",
+      "html": "<html><body>Document 2</body></html>",
+      "options": {
+        "format": "Letter"
+      }
+    }
+  ],
+  "concurrency": 3
+}
+```
+
+**Response**: JSON object with results
+```json
+{
+  "results": [
+    {
+      "id": "unique-id-1",
+      "success": true,
+      "pdf": "base64-encoded-pdf-data"
+    },
+    {
+      "id": "unique-id-2",
+      "success": true,
+      "pdf": "base64-encoded-pdf-data"
+    }
+  ],
+  "total": 2,
+  "successful": 2,
+  "failed": 0
+}
+```
+
+## Batch Item Schema
+Each item in the `batch` array must have:
+- `id` (required): Unique identifier for tracking
+- `html` (required): HTML content string
+- `options` (optional): PDF generation options
+  - `format`: "A4", "Letter", etc. (default: "A4")
+  - `printBackground`: boolean (default: true)
+  - `margin`: object with top/right/bottom/left
+
+## Example Usage
+
+### Using curl
+```bash
+# Single mode
+curl -X POST http://localhost:8787/pdf \
+  -H "Content-Type: application/json" \
+  -d '{"html":"<html><body><h1>Test</h1></body></html>"}' \
+  --output single.pdf
+
+# Batch mode
+curl -X POST http://localhost:8787/pdf \
+  -H "Content-Type: application/json" \
+  -d @test-batch.json \
+  --output batch-results.json
+```
+
+### Processing Batch Results
+```javascript
+const response = await fetch('http://localhost:8787/pdf', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    batch: [
+      { id: '1', html: '<html>...</html>' },
+      { id: '2', html: '<html>...</html>' }
+    ],
+    concurrency: 3
+  })
+});
+
+const { results } = await response.json();
+
+results.forEach(result => {
+  if (result.success) {
+    // Decode base64 PDF
+    const pdfBuffer = Buffer.from(result.pdf, 'base64');
+    // Save or process PDF
+  } else {
+    console.error(`Failed to process ${result.id}:`, result.error);
+  }
+});
+```
+
+## Performance Characteristics
+
+### Concurrency Model
+Items are distributed across browser sessions using round-robin distribution. Browsers launch sequentially with delays to respect rate limits (3 browsers/minute). Each browser processes multiple items using separate tabs.
+
+### Example: 7 Items with Concurrency=2 (Default)
+```
+Browser 1: Items [1, 3, 5, 7] - processes sequentially in tabs
+  └─ Launch: 0s
+Browser 2: Items [2, 4, 6]    - processes sequentially in tabs
+  └─ Launch: 22s (after 22 second delay)
+```
+**Total time**: ~22 seconds + processing time for all PDFs
+
+### Example: 10 Items with Concurrency=2
+```
+Browser 1: Items [1, 3, 5, 7, 9]  - 5 PDFs sequentially
+  └─ Launch: 0s
+Browser 2: Items [2, 4, 6, 8, 10] - 5 PDFs sequentially
+  └─ Launch: 22s (after 22 second delay)
+```
+
+### Rate Limit Compliance
+- **3 browsers per minute limit**: We launch max 2 browsers with 22s delay = compliant
+- **Retry logic**: If rate limit hit, exponential backoff (1s, 2s, 4s delays)
+- **Browser reuse**: Each browser generates multiple PDFs using tabs (efficient)
+
+## Error Handling
+- Individual item failures don't stop batch processing
+- Failed items return `{ success: false, error: "message" }`
+- Successful items return `{ success: true, pdf: "base64..." }`
+- Response includes summary: `total`, `successful`, `failed`
+
+## Validation
+The worker validates:
+- Each batch item has required `id` field
+- Each batch item has required `html` field
+- Concurrency is capped at 3 (even if higher value is requested)
+
+## Limitations & Best Practices
+
+### Cloudflare Rate Limits
+- **3 concurrent browsers** per account maximum
+- **3 new browser launches** per minute
+- **60 second timeout** per browser (default)
+
+### Best Practices
+- **Batch size**: Recommended 2-20 items per request
+- **Large batches**: For 20+ items, consider splitting into multiple requests
+- **Timing**: Allow 22+ seconds between browser launches
+- **Retries**: Built-in retry logic handles transient rate limit errors
+
+### Cost Considerations
+- Browser rendering time counts against Worker CPU time
+- Each PDF generation uses browser resources
+- Optimize HTML content for faster rendering
+</file>
+
+<file path="package.json">
+{
+	"name": "browser-worker",
+	"version": "0.0.0",
+	"private": true,
+	"scripts": {
+		"deploy": "wrangler deploy",
+		"dev": "wrangler dev",
+		"start": "wrangler dev",
+		"test": "vitest"
+	},
+	"devDependencies": {
+		"@cloudflare/puppeteer": "^1.0.4",
+		"@cloudflare/vitest-pool-workers": "^0.8.19",
+		"vitest": "~3.2.0",
+		"wrangler": "^4.40.2"
+	}
+}
+</file>
+
+<file path="test-batch.json">
+{
+  "batch": [
+    {
+      "id": "doc-1",
+      "html": "<html><body><h1>Document 1</h1><p>This is the first test document.</p></body></html>",
+      "options": {
+        "format": "A4",
+        "printBackground": true
+      }
+    },
+    {
+      "id": "doc-2",
+      "html": "<html><body><h1>Document 2</h1><p>This is the second test document.</p></body></html>",
+      "options": {
+        "format": "Letter"
+      }
+    },
+    {
+      "id": "doc-3",
+      "html": "<html><body><h1>Document 3</h1><p>This is the third test document with more content.</p><ul><li>Item 1</li><li>Item 2</li><li>Item 3</li></ul></body></html>"
+    },
+    {
+      "id": "doc-4",
+      "html": "<html><body><h1>Document 4</h1><table><tr><th>Name</th><th>Value</th></tr><tr><td>Test</td><td>123</td></tr></table></body></html>"
+    },
+    {
+      "id": "doc-5",
+      "html": "<html><body><h1>Document 5</h1><p>Final document in batch.</p></body></html>"
+    }
+  ],
+  "concurrency": 3
+}
+</file>
+
+<file path="vitest.config.js">
+import { defineWorkersConfig } from '@cloudflare/vitest-pool-workers/config';
+
+export default defineWorkersConfig({
+	test: {
+		poolOptions: {
+			workers: {
+				wrangler: { configPath: './wrangler.jsonc' },
+			},
+		},
+	},
+});
+</file>
+
+<file path="wrangler.jsonc">
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "browser-worker",
+	"main": "src/index.js",
+	"compatibility_date": "2025-09-27",
+	"compatibility_flags": ["nodejs_compat"],
+	"observability": {
+		"enabled": true
+	},
+	"browser": {
+		"binding": "BROWSER",
+		"experimental_remote": true
+	},
+	/**
+	 * Smart Placement
+	 * Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
+	 */
+	// "placement": { "mode": "smart" }
+	/**
+	 * Bindings
+	 * Bindings allow your Worker to interact with resources on the Cloudflare Developer Platform, including
+	 * databases, object storage, AI inference, real-time communication and more.
+	 * https://developers.cloudflare.com/workers/runtime-apis/bindings/
+	 */
+	/**
+	 * Environment Variables
+	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
+	 */
+	// "vars": { "MY_VARIABLE": "production_value" }
+	/**
+	 * Note: Use secrets to store sensitive data.
+	 * https://developers.cloudflare.com/workers/configuration/secrets/
+	 */
+	/**
+	 * Static Assets
+	 * https://developers.cloudflare.com/workers/static-assets/binding/
+	 */
+	// "assets": { "directory": "./public/", "binding": "ASSETS" }
+	/**
+	 * Service Bindings (communicate between multiple Workers)
+	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
+	 */
+	// "services": [{ "binding": "MY_SERVICE", "service": "my-service" }]
+}
+</file>
+
+</files>
