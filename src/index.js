@@ -16,13 +16,31 @@ export default {
       );
     }
 
-    // Handle direct POST requests for testing
+    // Handle direct POST requests for PDF generation
     if (request.method === 'POST' && new URL(request.url).pathname === '/pdf') {
-      const html = await request.text();
-      const browser = await puppeteer.connect(env.BROWSER);
+      let html, options;
+
+      // Check if body is JSON or plain HTML
+      const contentType = request.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        const body = await request.json();
+        html = body.html;
+        options = body.options || {};
+      } else {
+        html = await request.text();
+        options = {};
+      }
+
+      const browser = await puppeteer.launch(env.BROWSER);
       const page = await browser.newPage();
-      await page.setContent(html);
-      const pdf = await page.pdf({ format: 'A4', printBackground: true });
+      await page.setContent(html, { waitUntil: 'networkidle0' });
+
+      const pdf = await page.pdf({
+        format: options.format || 'A4',
+        printBackground: options.printBackground !== false,
+        margin: options.margin || { top: '1cm', right: '1cm', bottom: '1cm', left: '1cm' }
+      });
+
       await browser.close();
 
       return new Response(pdf, {
@@ -45,7 +63,7 @@ export default {
     let browser;
     try {
       // Launch browser using Cloudflare Puppeteer
-      browser = await puppeteer.connect(env.BROWSER);
+      browser = await puppeteer.launch(env.BROWSER);
       const page = await browser.newPage();
 
       // Set the HTML content
