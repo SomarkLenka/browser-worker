@@ -1,6 +1,47 @@
 import puppeteer from '@cloudflare/puppeteer';
 
 /**
+ * Sleep utility for delays
+ */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Launch browser with retry logic and exponential backoff
+ */
+async function launchBrowserWithRetry(env, maxRetries = 3, initialDelay = 1000) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`Launching browser (attempt ${attempt}/${maxRetries})`);
+      return await puppeteer.launch(env.BROWSER);
+    } catch (error) {
+      lastError = error;
+      console.error(`Browser launch attempt ${attempt} failed:`, error.message);
+
+      // Check if it's a rate limit error
+      if (error.message?.includes('429') || error.message?.includes('Rate limit')) {
+        if (attempt < maxRetries) {
+          const delay = initialDelay * Math.pow(2, attempt - 1);
+          console.log(`Rate limit hit, waiting ${delay}ms before retry...`);
+          await sleep(delay);
+          continue;
+        }
+      }
+
+      // If not rate limit or last attempt, throw
+      if (attempt === maxRetries) {
+        throw new Error(`Failed to launch browser after ${maxRetries} attempts: ${error.message}`);
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+/**
  *  Browser-Rendering Worker
  *  – one public GET / for health
  *  – one RPC method htmlToPdf() that other Workers call via service binding
@@ -51,7 +92,7 @@ export default {
         // BATCH MODE
         if (requestBody.batch && Array.isArray(requestBody.batch)) {
           console.log(`Processing batch of ${requestBody.batch.length} items`);
-          return await this.processBatch(requestBody.batch, requestBody.concurrency || 3, env);
+          return await this.processBatch(requestBody.batch, requestBody.concurrency || 2, env);
         }
 
         // SINGLE MODE (backward compatibility)
@@ -64,7 +105,7 @@ export default {
           throw new Error('No HTML content provided. Expected { html: string, options?: object } or { batch: [...], concurrency?: number }');
         }
 
-        const browser = await puppeteer.launch(env.BROWSER);
+        const browser = await launchBrowserWithRetry(env);
         const page = await browser.newPage();
         await page.setContent(html, { waitUntil: 'networkidle0' });
 
@@ -104,9 +145,11 @@ export default {
   /**
    * Process batch of HTML to PDF conversions with controlled concurrency
    * @param {Array} batch - Array of { id, html, options } objects
-   * @param {number} concurrency - Max concurrent browser sessions (default: 3)
+   * @param {number} concurrency - Max concurrent browser sessions (default: 2)
    * @param {Object} env - Environment bindings
    * @returns {Response} JSON response with results array
+   *
+   * Note: Cloudflare limits: 3 browsers per account, 3 new browsers per minute
    */
   async processBatch(batch, concurrency, env) {
     // Validate batch items
@@ -119,12 +162,13 @@ export default {
       }
     }
 
-    // Cap concurrency at 3 browsers max
-    const maxConcurrency = Math.min(concurrency, 3);
+    // Cap concurrency at 2 browsers to stay under rate limits (3/minute)
+    // This allows for retries without hitting the limit
+    const maxConcurrency = Math.min(concurrency, 2);
     console.log(`Batch processing ${batch.length} items with ${maxConcurrency} concurrent browsers`);
 
     // Distribute items across browser sessions in round-robin fashion
-    // For 7 items with concurrency=3: [[1,4,7], [2,5], [3,6]]
+    // For 7 items with concurrency=2: [[1,3,5,7], [2,4,6]]
     const chunks = Array.from({ length: maxConcurrency }, () => []);
     batch.forEach((item, index) => {
       chunks[index % maxConcurrency].push(item);
@@ -135,14 +179,23 @@ export default {
     console.log(`Distributed ${batch.length} items across ${nonEmptyChunks.length} browsers: ${nonEmptyChunks.map(c => c.length).join(', ')} items each`);
 
     try {
-      // Process each chunk in parallel (each chunk = one browser session)
-      const allResults = await Promise.all(
-        nonEmptyChunks.map(async (chunk, chunkIndex) => {
-          console.log(`Browser ${chunkIndex + 1}/${nonEmptyChunks.length} processing ${chunk.length} items: ${chunk.map(c => c.id).join(', ')}`);
+      const allResults = [];
 
-          let browser;
-          try {
-            browser = await puppeteer.launch(env.BROWSER);
+      // Process browsers sequentially with delay to respect rate limits (3/minute)
+      for (let chunkIndex = 0; chunkIndex < nonEmptyChunks.length; chunkIndex++) {
+        const chunk = nonEmptyChunks[chunkIndex];
+        console.log(`Browser ${chunkIndex + 1}/${nonEmptyChunks.length} processing ${chunk.length} items: ${chunk.map(c => c.id).join(', ')}`);
+
+        // Add delay between browser launches (20+ seconds to stay under 3/minute)
+        if (chunkIndex > 0) {
+          const delayMs = 22000; // 22 seconds between launches
+          console.log(`Waiting ${delayMs}ms before launching next browser (rate limit: 3/minute)...`);
+          await sleep(delayMs);
+        }
+
+        let browser;
+        try {
+          browser = await launchBrowserWithRetry(env);
 
             // Within this browser session, process items sequentially
             const chunkResults = [];
@@ -177,25 +230,22 @@ export default {
               }
             }
 
-            return chunkResults;
-          } finally {
-            if (browser) {
-              await browser.close();
-              console.log(`Browser ${chunkIndex + 1} closed`);
-            }
+          allResults.push(...chunkResults);
+        } finally {
+          if (browser) {
+            await browser.close();
+            console.log(`Browser ${chunkIndex + 1} closed`);
           }
-        })
-      );
+        }
+      }
 
-      // Flatten results from all browser sessions
-      const results = allResults.flat();
-      console.log(`Batch complete. Processed ${results.length} items`);
+      console.log(`Batch complete. Processed ${allResults.length} items`);
 
       return new Response(JSON.stringify({
-        results,
-        total: results.length,
-        successful: results.filter(r => r.success).length,
-        failed: results.filter(r => !r.success).length
+        results: allResults,
+        total: allResults.length,
+        successful: allResults.filter(r => r.success).length,
+        failed: allResults.filter(r => !r.success).length
       }), {
         headers: { 'content-type': 'application/json' }
       });
@@ -216,8 +266,8 @@ export default {
 
     let browser;
     try {
-      // Launch browser using Cloudflare Puppeteer
-      browser = await puppeteer.launch(env.BROWSER);
+      // Launch browser with retry logic
+      browser = await launchBrowserWithRetry(env);
       const page = await browser.newPage();
 
       // Set the HTML content

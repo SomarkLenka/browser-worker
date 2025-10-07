@@ -9,14 +9,23 @@ The browser-worker now supports hybrid batch processing with controlled concurre
 ### Strategy
 - **Single Activity (1 item)**: Direct single call
 - **Small Batch (2-4 items)**: Single batch call, sequential processing in one browser session
-- **Large Batch (5+ items)**: Split into chunks, spawn multiple browser sessions concurrently (max 3)
+- **Large Batch (5+ items)**: Multiple browser sessions with staggered launches
 
 ### Implementation Details
-- Maximum concurrent browsers: **3** (hard limit)
-- Items are split into chunks and processed in parallel
-- Within each browser session, items are processed sequentially
+- **Rate Limits (Cloudflare Workers Browser Binding)**:
+  - Maximum concurrent browsers: **3 per account**
+  - Maximum new browsers: **3 per minute**
+  - Browser timeout: **60 seconds** (can extend to 10 minutes with keep_alive)
+
+- **Our Approach**:
+  - Default concurrency: **2 browsers** (leaves room for retries)
+  - Staggered browser launches: **22 second delay** between launches
+  - Retry logic with exponential backoff for rate limit errors
+  - Multiple PDFs generated per browser session using tabs (efficient reuse)
+
 - Each item in a batch must have a unique `id` for tracking
 - Robust error handling per item (one failure doesn't stop the batch)
+- Browser sessions are reused for multiple PDFs to optimize performance
 
 ## Request Formats
 
@@ -140,23 +149,29 @@ results.forEach(result => {
 ## Performance Characteristics
 
 ### Concurrency Model
-Items are distributed across browser sessions using round-robin distribution. All browsers run in parallel, processing their assigned items sequentially.
+Items are distributed across browser sessions using round-robin distribution. Browsers launch sequentially with delays to respect rate limits (3 browsers/minute). Each browser processes multiple items using separate tabs.
 
-### Example: 7 Items with Concurrency=3
+### Example: 7 Items with Concurrency=2 (Default)
 ```
-Browser 1: Items [1, 4, 7] - processes sequentially
-Browser 2: Items [2, 5]    - processes sequentially
-Browser 3: Items [3, 6]    - processes sequentially
+Browser 1: Items [1, 3, 5, 7] - processes sequentially in tabs
+  └─ Launch: 0s
+Browser 2: Items [2, 4, 6]    - processes sequentially in tabs
+  └─ Launch: 22s (after 22 second delay)
 ```
-All 3 browsers run **concurrently**, but each browser processes its items **sequentially**.
+**Total time**: ~22 seconds + processing time for all PDFs
 
-### Example: 10 Items with Concurrency=3
+### Example: 10 Items with Concurrency=2
 ```
-Browser 1: Items [1, 4, 7, 10] - 4 items sequentially
-Browser 2: Items [2, 5, 8]     - 3 items sequentially
-Browser 3: Items [3, 6, 9]     - 3 items sequentially
+Browser 1: Items [1, 3, 5, 7, 9]  - 5 PDFs sequentially
+  └─ Launch: 0s
+Browser 2: Items [2, 4, 6, 8, 10] - 5 PDFs sequentially
+  └─ Launch: 22s (after 22 second delay)
 ```
-All 3 browsers run in parallel simultaneously.
+
+### Rate Limit Compliance
+- **3 browsers per minute limit**: We launch max 2 browsers with 22s delay = compliant
+- **Retry logic**: If rate limit hit, exponential backoff (1s, 2s, 4s delays)
+- **Browser reuse**: Each browser generates multiple PDFs using tabs (efficient)
 
 ## Error Handling
 - Individual item failures don't stop batch processing
@@ -170,8 +185,20 @@ The worker validates:
 - Each batch item has required `html` field
 - Concurrency is capped at 3 (even if higher value is requested)
 
-## Limitations
-- Maximum concurrent browsers: 3 (Cloudflare Workers constraint)
-- Browser sessions have timeout limits (check Cloudflare docs)
-- Memory limits apply per Worker invocation
-- Recommended batch size: 10-50 items per request
+## Limitations & Best Practices
+
+### Cloudflare Rate Limits
+- **3 concurrent browsers** per account maximum
+- **3 new browser launches** per minute
+- **60 second timeout** per browser (default)
+
+### Best Practices
+- **Batch size**: Recommended 2-20 items per request
+- **Large batches**: For 20+ items, consider splitting into multiple requests
+- **Timing**: Allow 22+ seconds between browser launches
+- **Retries**: Built-in retry logic handles transient rate limit errors
+
+### Cost Considerations
+- Browser rendering time counts against Worker CPU time
+- Each PDF generation uses browser resources
+- Optimize HTML content for faster rendering
